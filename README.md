@@ -3,7 +3,7 @@
 A conservative, multi-tier scoring pipeline to detect bot accounts in social media datasets (Bot or Not Challenge format).  
 It supports English (EN) and French (FR) datasets by using the dataset's `"lang"` field and switching language-specific signals.
 
-# Team Name : Bot_Smashers
+## Team Name : Bot_Smashers
 
 ## What This Repository Contains
 
