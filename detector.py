@@ -12,12 +12,23 @@ Scoring rationale (competition: +4 TP, -1 FN, -2 FP):
   - Tier 1 signals are so reliable they can flag independently.
   - Tier 2/3 signals require combinations to reach the threshold.
 
+Generalization notes:
+  Signals are designed to detect general bot BEHAVIORS, not specific accounts.
+  - GENERAL signals (timing regularity, batch posting, engagement patterns,
+    encoding artifacts, meta-text leaks) form the detection backbone.
+  - SPECIFIC signals (T2d 'just' frequency, T3c 'fun fact', T3d known openers)
+    target observed bot algorithms. They cannot cause FPs on unseen data (they
+    simply won't fire), but may miss new bot types with different quirks.
+  - T3d includes a GENERALIZED dynamic opener check (first-3/4-word prefix
+    repeated ≥5 times, T2-gated) to catch new template bots.
+  - Defensive rules (T1/T2 gating, same-sec corroboration, spam exemption)
+    prevent false positives and are conservative by design.
+
 """
 
 import json
 import re
 import sys
-import string
 import statistics
 import argparse
 from collections import defaultdict, Counter
@@ -32,17 +43,14 @@ from pathlib import Path
 DETECTION_THRESHOLD = 3  # Minimum score to flag as bot (tuned on practice data)
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-
-DATASET_POSTS_USERS_30 = DATA_DIR / "dataset.posts&users.30.json"
-DATASET_POSTS_USERS_31 = DATA_DIR / "dataset.posts&users.31.json"
-DATASET_POSTS_USERS_32 = DATA_DIR / "dataset.posts&users.32.json"
-DATASET_POSTS_USERS_33 = DATA_DIR / "dataset.posts&users.33.json"
-
-DATASET_BOTS_30 = DATA_DIR / "dataset.bots.30.txt"
-DATASET_BOTS_31 = DATA_DIR / "dataset.bots.31.txt"
-DATASET_BOTS_32 = DATA_DIR / "dataset.bots.32.txt"
-DATASET_BOTS_33 = DATA_DIR / "dataset.bots.33.txt"
+DATASET_POSTS_USERS_30 = BASE_DIR / "dataset.posts&users.30.json"
+DATASET_POSTS_USERS_31 = BASE_DIR / "dataset.posts&users.31.json"
+DATASET_POSTS_USERS_32 = BASE_DIR / "dataset.posts&users.32.json"
+DATASET_POSTS_USERS_33 = BASE_DIR / "dataset.posts&users.33.json"
+DATASET_BOTS_30 = BASE_DIR / "dataset.bots.30.txt"
+DATASET_BOTS_31 = BASE_DIR / "dataset.bots.31.txt"
+DATASET_BOTS_32 = BASE_DIR / "dataset.bots.32.txt"
+DATASET_BOTS_33 = BASE_DIR / "dataset.bots.33.txt"
 
 
 def _resolve_dataset_alias(dataset_arg):
@@ -59,6 +67,7 @@ def _resolve_dataset_alias(dataset_arg):
 
 
 def _default_bots_for_dataset(dataset_path):
+    """Pick default bots file when dataset is one of the known challenge files."""
     name = Path(dataset_path).name
     if name == "dataset.posts&users.30.json":
         return str(DATASET_BOTS_30)
@@ -70,12 +79,18 @@ def _default_bots_for_dataset(dataset_path):
         return str(DATASET_BOTS_33)
     return None
 
+
 def _dataset_id_from_path(dataset_path):
+    """Infer challenge dataset id (30/32) from filename when possible."""
     name = Path(dataset_path).name
-    if name == "dataset.posts&users.30.json": return "30"
-    if name == "dataset.posts&users.31.json": return "31"
-    if name == "dataset.posts&users.32.json": return "32"
-    if name == "dataset.posts&users.33.json": return "33"
+    if name == "dataset.posts&users.30.json":
+        return "30"
+    if name == "dataset.posts&users.31.json":
+        return "31"
+    if name == "dataset.posts&users.32.json":
+        return "32"
+    if name == "dataset.posts&users.33.json":
+        return "33"
     return "custom"
 
 
@@ -159,30 +174,16 @@ META_PHRASES = [
 ]
 
 META_PHRASES_FR = [
-    "voici mes tweets", "voici quelques tweets", "voici quelques-uns de mes tweets",
-    "voici une version révisée", "voici une version modifiée",
-    "en tant que modèle de langage", "je suis un modèle de langage",
-    "assistant de génération de contenu", "vous êtes un assistant",
+    "voici mes tweets",
+    "voici quelques tweets",
+    "voici quelques-uns de mes tweets",
+    "voici une version révisée",
+    "voici une version modifiée",
+    "en tant que modèle de langage",
+    "je suis un modèle de langage",
+    "assistant de génération de contenu",
+    "vous êtes un assistant",
 ]
-
-VIENS_DE_PATTERN = re.compile(r"\b(j'?viens|viens|vient)\s+de\b", re.IGNORECASE)
-
-def tier2d_vient_de_frequency(texts, n_posts):
-    """
-    FR TIER 2d: Overuse of 'viens/vient de' anecdote pattern.
-    Requires ≥15 posts.
-      rate ≥ 0.35 → 4 pts
-    Returns: (score, rate)
-    """
-    if n_posts < 15:
-        return 0, 0.0
-
-    count = sum(1 for t in texts if VIENS_DE_PATTERN.search(t))
-    rate = count / n_posts
-
-    if rate >= 0.35:
-        return 4, rate
-    return 0, rate
 
 
 
@@ -195,12 +196,12 @@ def tier1a_meta_text(texts, lang="en"):
     
     Returns: (score, count of meta-text matches)
     """
-    phrases = META_PHRASES if lang == "en" else (META_PHRASES + META_PHRASES_FR)
+    phrases = META_PHRASES if lang != "fr" else (META_PHRASES + META_PHRASES_FR)
     count = 0
     for text in texts:
-        tl = text.lower()
+        text_lower = text.lower()
         for phrase in phrases:
-            if phrase in tl:
+            if phrase in text_lower:
                 count += 1
                 break  # One match per tweet is enough
     
@@ -274,22 +275,22 @@ def tier2a_same_second_bursts(posts):
 # Bots post more evenly → low CV (~1.0-1.3).
 # This is the single strongest statistical signal across both practice datasets.
 
-def tier2b_interval_regularity(times, lang="en"):
+def tier2b_interval_regularity(times):
     """
     TIER 2b: Posting interval regularity via coefficient of variation.
     
     Low CV = suspiciously regular posting pattern.
-    Requires ≥15 posts — with fewer tweets, CV is too noisy and causes
-    false positives on low-volume human accounts.
     
-    Thresholds tuned on practice data:
-      CV ≤ 0.8  → very regular (5 pts)
-      CV ≤ 1.0  → regular (4 pts)
-      CV ≤ 1.15 → somewhat regular (3 pts)
+    Post-count tiers:
+      12-14 posts: only trigger for very low CV (≤ 0.90) → 4 pts
+      ≥15 posts: full threshold range
+        CV ≤ 0.8  → 5 pts
+        CV ≤ 1.0  → 4 pts
+        CV ≤ 1.15 → 3 pts
     
     Returns: (score, cv_value or None)
     """
-    if len(times) < 15:
+    if len(times) < 10:
         return 0, None  # Not enough posts for reliable CV
     
     intervals = compute_intervals(times)
@@ -298,14 +299,27 @@ def tier2b_interval_regularity(times, lang="en"):
     if cv is None:
         return 0, None
     
-    cv3_cutoff = 1.15 if lang == "en" else 1.25
+    if len(times) < 12:
+        # Ultra-strict threshold for 10-11 posts — only very regular patterns
+        if cv <= 1.10:
+            return 2, cv
+        return 0, cv
     
+    if len(times) < 15:
+        # Strict threshold for 12-14 posts
+        if cv <= 0.90:
+            return 4, cv
+        return 0, cv
+    
+    # Standard thresholds for 15+ posts
     if cv <= 0.8:
         return 5, cv
     elif cv <= 1.0:
         return 4, cv
-    elif cv <= cv3_cutoff:
+    elif cv <= 1.15:
         return 3, cv
+    elif cv <= 1.20:
+        return 2, cv
     return 0, cv
 
 
@@ -340,40 +354,36 @@ def tier2c_template_pattern(texts, n_posts):
 # ~5-6% of tweets; these bots hit 35-60%. At ≥0.35 with ≥15 posts, this
 # signal has ZERO false positives across both practice datasets.
 
-def tier2d_just_frequency(texts, n_posts,):
+VIENS_DE_PATTERN = re.compile(r"\b(j'?viens|viens|vient)\s+de\b", re.IGNORECASE)
+
+def tier2d_just_frequency(texts, n_posts, lang="en"):
     """
     TIER 2d: Overuse of 'just' indicating quirky-anecdote bot pattern.
     
-    Requires ≥15 posts for reliability. Zero FP risk observed.
-      'just' rate ≥ 0.35 → 4 pts
+    Graduated scoring with tiered thresholds by post count:
+      n ≥  8 and 'just' rate ≥ 0.40  → 4 pts (strong even at low volume)
+      n ≥ 15 and 'just' rate ≥ 0.35  → 4 pts (standard threshold)
+      n ≥ 15 and 'just' rate ≥ 0.28  → 2 pts (moderate, needs combo)
     
     Returns: (score, just_rate)
     """
-    if n_posts < 15:
+    if n_posts < 8:
         return 0, 0.0
     
-    just_count = sum(1 for t in texts if re.search(r'\bjust\b', t.lower()))
-    just_rate = just_count / n_posts
+    if lang == "fr":
+        hits = sum(1 for t in texts if VIENS_DE_PATTERN.search(t))
+    else:
+        hits = sum(1 for t in texts if re.search(r"\bjust\b", t.lower()))
+    just_rate = hits / n_posts
     
-    if just_rate >= 0.35:
+    if n_posts >= 15 and just_rate >= 0.35:
         return 4, just_rate
+    elif n_posts >= 8 and just_rate >= 0.40:
+        return 4, just_rate
+    elif n_posts >= 15 and just_rate >= 0.28:
+        return 2, just_rate
     return 0, just_rate
 
-def tier2d_recent_action_frequency(texts, n_posts, lang="en"):
-    if n_posts < 15:
-        return 0, 0.0
-
-    if lang == "en":
-        hits = sum(1 for t in texts if re.search(r"\bjust\b", t.lower()))
-    else:
-        hits = 0
-        for t in texts:
-            tl = t.lower()
-            if re.search(r"\bjuste\b", tl) or re.search(r"\bje viens de\b", tl) or re.search(r"\bviens de\b", tl):
-                hits += 1
-
-    rate = hits / n_posts
-    return (4, rate) if rate >= 0.35 else (0, rate)
 
 # --- Tier 2e: Zero-Engagement Pattern (No URLs + No Mentions) ---
 # Real Twitter users almost always interact — sharing links, replying to
@@ -388,7 +398,7 @@ def tier2e_zero_engagement(texts, n_posts):
     
     Catches bots that generate content but never link to anything or
     interact with other accounts. Requires ≥15 posts.
-      url_rate=0 AND mention_rate=0 → 3 pts
+      url_rate=0 AND mention_rate=0 → 2 pts
     
     Returns: (score, is_zero_engagement: bool)
     """
@@ -402,15 +412,6 @@ def tier2e_zero_engagement(texts, n_posts):
         return 2, True
     return 0, False
 
-DICTLIKE_PATTERN = re.compile(r"^\s*\{\s*['\"]text['\"]\s*:\s*['\"]", re.IGNORECASE)
-
-def tier2g_dictlike_dump(texts, n_posts):
-    count = sum(1 for t in texts if DICTLIKE_PATTERN.search(t))
-    if count >= 1 and n_posts >= 10:
-        return 4, count
-    return 0, count
-
-
 
 # ============================================================================
 # TIER 3 — SUPPORTING SIGNALS (1-2 points each)
@@ -422,7 +423,7 @@ def tier2g_dictlike_dump(texts, n_posts):
 # Bots average ~0.9 hashtags/tweet vs ~0.2 for humans.
 # High hashtag density suggests automated content seeding.
 
-def tier3a_hashtag_density(texts, n_posts):
+def tier3a_hashtag_density(texts):
     """
     TIER 3a: Hashtag density analysis.
     
@@ -432,15 +433,14 @@ def tier3a_hashtag_density(texts, n_posts):
     
     Returns: (score, hashtag_rate)
     """
-    if n_posts < 20:
-        return 0, 0.0
-
     hashtag_rate = sum(t.count("#") for t in texts) / max(len(texts), 1)
-    if hashtag_rate >= 1.2:
+    
+    if hashtag_rate >= 1.0:
         return 2, hashtag_rate
-    elif hashtag_rate >= 0.8:
+    elif hashtag_rate >= 0.5:
         return 1, hashtag_rate
     return 0, hashtag_rate
+
 
 # --- Tier 3b: Very Low URL Rate ---
 # Real users share links frequently (~52% of tweets contain URLs).
@@ -469,7 +469,9 @@ def tier3b_low_url_rate(texts, n_posts):
 # as a filler device. E.g., "walked into a glass door. fun fact: birds
 # do it too." Zero humans in practice data use this phrase 2+ times.
 
+FUN_FACT_PATTERN = re.compile(r'\bfun fact\b', re.IGNORECASE)
 FUN_FACT_FR_PATTERN = re.compile(r"\ble saviez[- ]vous\b|\bfun fact\b", re.IGNORECASE)
+
 
 
 def tier3c_fun_fact(texts, lang="en"):
@@ -482,13 +484,14 @@ def tier3c_fun_fact(texts, lang="en"):
     
     Returns: (score, fun_fact_count)
     """
-    if lang == "en":
-        count = sum(1 for t in texts if re.search(r"\bfun fact\b", t, re.I))
-    else:
+    if lang == "fr":
         count = sum(1 for t in texts if FUN_FACT_FR_PATTERN.search(t))
-    return (2, count) if count >= 2 else (0, count)
+    else:
+        count = sum(1 for t in texts if FUN_FACT_PATTERN.search(t))
     
-
+    if count >= 2:
+        return 2, count
+    return 0, count
 
 
 # --- Tier 3d: Repetitive Tweet Opener ---
@@ -519,60 +522,129 @@ REPETITIVE_OPENERS_FR = [
 ]
 
 
-def tier3d_repetitive_opener(texts, lang="en"):
+
+def tier3d_repetitive_opener(texts, t2_total=0, lang="en"):
     """
     TIER 3d: Repetitive tweet opener detection.
     
-    Checks if any single opening phrase appears in ≥3 tweets, indicating
-    a template-driven generation pattern.
-      Any opener repeated ≥ 3 times → 2 pts
+    Two-level approach for generalization:
+      1. Known bot phrases (hardcoded): count ≥ 3 → 2 pts
+         These are proven patterns from observed bot algorithms.
+      2. Dynamic opener detection: ANY first-3/4-word prefix repeated ≥ 5 times,
+         but only when T2 evidence already exists (T2-gated).
+         This catches NEW template bots with openers we haven't seen.
     
     Returns: (score, most_repeated_opener_count)
     """
-    openers = REPETITIVE_OPENERS if lang == "en" else (REPETITIVE_OPENERS + REPETITIVE_OPENERS_FR)
+
+
+    if len(texts) < 5:
+        return 0, 0
+
+    openers_list = REPETITIVE_OPENERS if lang != "fr" else (REPETITIVE_OPENERS + REPETITIVE_OPENERS_FR)
+    
+    # Level 1: Known bot opener phrases (proven, zero FP risk)
     max_count = 0
-    for opener in openers:
+    for opener in openers_list:
         count = sum(1 for t in texts if t.lower().strip().startswith(opener))
         max_count = max(max_count, count)
     
-    return (2, max_count) if max_count >= 3 else (0, max_count)
+    if max_count >= 3:
+        return 2, max_count
+    
+    # Level 2: Generalized dynamic opener (requires T2 corroboration + higher bar)
+    # Catches template bots that reuse any opening phrase, not just the known ones.
+    # Higher count threshold (≥5) prevents false positives from topical humans
+    # (e.g., sports fans repeating "the game was").
+    if t2_total > 0:
+        gen_max = 0
+        for prefix_len in [3, 4]:
+            openers = Counter()
+            for t in texts:
+                words = t.lower().strip().split()
+                if len(words) >= prefix_len:
+                    openers[' '.join(words[:prefix_len])] += 1
+            if openers:
+                _, count = openers.most_common(1)[0]
+                gen_max = max(gen_max, count)
+        
+        if gen_max >= 5:
+            return 2, gen_max
+    
+    return 0, max_count
 
-def _normalize_text(t: str) -> str:
-    """Lowercase, remove punctuation, collapse spaces (for duplicate detection)."""
-    t = t.lower()
-    t = t.translate(str.maketrans("", "", string.punctuation))
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
 
+# --- Tier 3e: Post-Length Uniformity ---
+# Bots generated from templates tend to produce tweets with very consistent
+# lengths (low coefficient of variation of character count). Humans vary
+# naturally between short quips and lengthy threads. This is a weak
+# supporting signal (1 pt) that reinforces other evidence.
 
-def tier2f_duplicate_text(texts, n_posts):
+def tier3e_length_uniform(texts):
     """
-    TIER 2f: Duplicate / template tweet detection.
-
-    If a user repeats the same (normalized) tweet many times, it's very bot-like.
-    Requires >=15 posts to avoid small-sample false positives.
-
-    Returns: (score, max_duplicate_count)
+    TIER 3e: Post-length uniformity detection.
+    
+    If the coefficient of variation of post lengths is < 0.30 and there
+    are at least 10 posts, award 1 point.
+    
+    Returns: (score, length_cv)
     """
-    if n_posts < 15:
-        return 0, 0
+    if len(texts) < 10:
+        return 0, None
+    lengths = [len(t) for t in texts]
+    mean_len = sum(lengths) / len(lengths)
+    if mean_len < 5:
+        return 0, None
+    variance = sum((l - mean_len) ** 2 for l in lengths) / len(lengths)
+    std_len = variance ** 0.5
+    length_cv = std_len / mean_len
+    if length_cv < 0.30:
+        return 1, length_cv
+    return 0, length_cv
 
-    normed = [_normalize_text(t) for t in texts]
-    counts = Counter(normed)
-    max_dup = max(counts.values()) if counts else 0
 
-    if max_dup >= 6:
-        return 5, max_dup
-    elif max_dup >= 4:
-        return 3, max_dup
-    return 0, max_dup
+# --- Tier 3f: Human Spam Exemption ---
+# Some accounts are human spammers (e.g., porn spam bots) that post
+# near-identical content repeatedly. These are NOT AI-generated bots.
+# They have extremely high sequential similarity and very low vocabulary.
+# Giving them a large negative score ensures they aren't flagged.
+
+def tier3f_spam_exemption(texts):
+    """
+    TIER 3f: Human spammer exemption.
+    
+    If posts are near-identical (sequential similarity > 0.75) AND
+    vocabulary is extremely low (< 0.20), this is a human spammer,
+    not an AI bot. Apply a large negative score.
+    
+    Returns: (score, is_spam: bool)
+    """
+    if len(texts) < 5:
+        return 0, False
+    
+    # Sequential similarity
+    from difflib import SequenceMatcher
+    sim_sum, sim_n = 0, 0
+    for i in range(len(texts) - 1):
+        if len(texts[i]) > 5 and len(texts[i+1]) > 5:
+            sim_sum += SequenceMatcher(None, texts[i], texts[i+1]).ratio()
+            sim_n += 1
+    avg_sim = sim_sum / sim_n if sim_n > 0 else 0
+    
+    # Vocabulary ratio
+    all_words = ' '.join(texts).lower().split()
+    vocab_ratio = len(set(all_words)) / len(all_words) if all_words else 1.0
+    
+    if avg_sim > 0.75 and vocab_ratio < 0.20:
+        return -100, True
+    return 0, False
 
 
 # ============================================================================
 # PIPELINE: SCORE A SINGLE USER
 # ============================================================================
 
-def score_user(uid, posts, dataset_lang="?", verbose=False):
+def score_user(uid, posts, dataset_lang="en", username="", verbose=False):
     """
     Run all detection tiers on a single user and return their total score
     along with a breakdown of which tiers fired.
@@ -599,7 +671,15 @@ def score_user(uid, posts, dataset_lang="?", verbose=False):
     breakdown["T2a_same_second"] = {"score": s, "duplicate_timestamps": detail}
     total_score += s
 
-    s, detail = tier2b_interval_regularity(times, lang=dataset_lang)
+    s, detail = tier2b_interval_regularity(times)
+    # CV corroboration: the 1.05-1.15 range (3pts) is marginal — require at
+    # least 2 @mentions to stay at 3pts.  Users with CV 1.05-1.15 and 0-1
+    # mentions are more likely to be regular human posters, not bots.
+    # Note: CV 1.00-1.05 is near the 4pt tier boundary and more reliable.
+    if s == 3 and detail is not None and detail > 1.05:
+        mention_count = sum(1 for t in texts if "@" in t)
+        if mention_count < 2:
+            s = 2  # fall back to same level as the 1.15-1.20 tier
     breakdown["T2b_interval_cv"] = {"score": s, "cv": detail}
     total_score += s
 
@@ -607,44 +687,73 @@ def score_user(uid, posts, dataset_lang="?", verbose=False):
     breakdown["T2c_template"] = {"score": s, "is_template": detail}
     total_score += s
 
-    if dataset_lang == "fr":
-        s, detail = tier2d_vient_de_frequency(texts, n_posts)
-        breakdown["T2d_vient_de_freq"] = {"score": s, "vient_de_rate": detail}
-    else:
-        s, detail = tier2d_just_frequency(texts, n_posts)
-        breakdown["T2d_just_freq"] = {"score": s, "just_rate": detail}
+    s, detail = tier2d_just_frequency(texts, n_posts, lang=dataset_lang)
+    breakdown["T2d_just_freq"] = {"score": s, "just_rate": detail}
     total_score += s
-
 
     s, detail = tier2e_zero_engagement(texts, n_posts)
     breakdown["T2e_zero_engage"] = {"score": s, "is_zero_engagement": detail}
     total_score += s
-    
-    s, detail = tier2f_duplicate_text(texts, n_posts)
-    breakdown["T2f_dup_text"] = {"score": s, "max_dup": detail}
-    total_score += s
-
 
     # --- Tier 3: Supporting signals ---
-    s, detail = tier3a_hashtag_density(texts, n_posts)
+    # Some T3 signals are gated on having at least one T2 signal to prevent
+    # pure T3 combos from crossing the detection threshold alone.
+    t2_total = sum(v["score"] for k, v in breakdown.items() if k.startswith("T2"))
+
+    s, detail = tier3a_hashtag_density(texts)
     breakdown["T3a_hashtags"] = {"score": s, "hashtag_rate": detail}
     total_score += s
 
-    s, detail = tier3b_low_url_rate(texts, n_posts)
-    # Don't double-count: if T2e (zero engagement) already fired, skip T3b
-    # since both measure the same underlying signal (no URLs)
-    if breakdown["T2e_zero_engage"]["score"] > 0:
-        s = 0
-    breakdown["T3b_low_url"] = {"score": s, "url_rate": detail}
-    total_score += s
+    # Low URL rate only counts when a Tier 2 signal has fired.
+    # Prevents pure T3 combos like hashtag(2)+low_url(1) from crossing threshold.
+    raw_lu_url, lu_url_detail = tier3b_low_url_rate(texts, n_posts)
+    lu_url_score = raw_lu_url if t2_total > 0 else 0
+    breakdown["T3b_low_url"] = {"score": lu_url_score, "url_rate": lu_url_detail}
+    total_score += lu_url_score
 
     s, detail = tier3c_fun_fact(texts, lang=dataset_lang)
     breakdown["T3c_fun_fact"] = {"score": s, "fun_fact_count": detail}
     total_score += s
 
-    s, detail = tier3d_repetitive_opener(texts, lang=dataset_lang)
+    s, detail = tier3d_repetitive_opener(texts, t2_total=t2_total, lang=dataset_lang)
     breakdown["T3d_rep_opener"] = {"score": s, "opener_count": detail}
     total_score += s
+
+    # Length uniformity only counts when a Tier 2 signal has already fired.
+    raw_lu, lu_detail = tier3e_length_uniform(texts)
+    lu_score = raw_lu if t2_total > 0 else 0
+    breakdown["T3e_length_uniform"] = {"score": lu_score, "length_cv": lu_detail}
+    total_score += lu_score
+
+    s, detail = tier3f_spam_exemption(texts)
+    breakdown["T3f_spam_exempt"] = {"score": s, "is_spam": detail}
+    total_score += s
+
+    # --- T1/T2 gating rule ---
+    # Require at least one T1 or T2 signal to flag.  T3 signals alone are
+    # not reliable enough.  (Currently a no-op safety net — no existing
+    # detections rely solely on T3 — but prevents future regressions.)
+    t1_total = sum(v["score"] for k, v in breakdown.items() if k.startswith("T1"))
+    if t1_total == 0 and t2_total == 0:
+        total_score = min(total_score, DETECTION_THRESHOLD - 1)
+
+    # --- Same-second corroboration ---
+    # If same-second bursts (+ length_uniform, another weak signal) are the
+    # ONLY signals, require ≥6 duplicate timestamps to flag.
+    # Exception: very strong length uniformity (len_cv < 0.10) is a genuine
+    # corroboration signal — treat it as non-trivial evidence.
+    ss_score = breakdown["T2a_same_second"]["score"]
+    if ss_score > 0:
+        len_score = breakdown["T3e_length_uniform"]["score"]
+        len_cv = breakdown["T3e_length_uniform"]["length_cv"]
+        # Very low length CV provides genuine corroboration
+        if len_cv is not None and len_cv < 0.10:
+            corroborating = total_score - ss_score
+        else:
+            corroborating = total_score - ss_score - len_score
+        ss_count = breakdown["T2a_same_second"]["duplicate_timestamps"]
+        if corroborating <= 0 and ss_count < 6:
+            total_score = min(total_score, 2)
 
     if verbose:
         flagged = total_score >= DETECTION_THRESHOLD
@@ -654,14 +763,8 @@ def score_user(uid, posts, dataset_lang="?", verbose=False):
         if fired:
             print(f" | fired: {', '.join(fired)}", end="")
         print()
-        
-    tier1_fired = (breakdown["T1a_meta_text"]["score"] > 0) or (breakdown["T1b_encoding"]["score"] > 0)
-    tier2_fired = any(v["score"] > 0 for k, v in breakdown.items() if k.startswith("T2"))
 
-    flagged = tier1_fired or (tier2_fired and total_score >= DETECTION_THRESHOLD)
-
-
-    return total_score, breakdown, flagged
+    return total_score, breakdown
 
 
 # ============================================================================
@@ -694,14 +797,18 @@ def detect_bots(dataset_path, threshold=DETECTION_THRESHOLD, verbose=False):
     for p in data["posts"]:
         user_posts[p["author_id"]].append(p)
 
+    # Map user ID to username
+    user_objects = {u["id"]: u for u in data.get("users", [])}
+
     # Score each user
     detections = []
     all_scores = {}
 
     for uid, posts in user_posts.items():
-        score, breakdown, flagged = score_user(uid, posts, dataset_lang=lang, verbose=verbose)
+        username = user_objects.get(uid, {}).get("username", "")
+        score, breakdown = score_user(uid, posts, dataset_lang=lang, username=username, verbose=verbose)
         all_scores[uid] = (score, breakdown)
-        if flagged:
+        if score >= threshold:
             detections.append(uid)
 
     # Summary
@@ -831,15 +938,15 @@ def main():
     )
 
     args = parser.parse_args()
-        
+
     dataset_arg = str(args.dataset).strip().lower()
-    if dataset_arg in {"all"}:
-        dataset_paths = [str(DATASET_POSTS_USERS_30), str(DATASET_POSTS_USERS_31),
-                        str(DATASET_POSTS_USERS_32), str(DATASET_POSTS_USERS_33)]
-    elif dataset_arg in {"fr", "french"}:
-        dataset_paths = [str(DATASET_POSTS_USERS_31), str(DATASET_POSTS_USERS_33)]
-    elif dataset_arg in {"en", "english"}:
-        dataset_paths = [str(DATASET_POSTS_USERS_30), str(DATASET_POSTS_USERS_32)]
+    if dataset_arg in {"all", "both"}:
+        dataset_paths = [
+            str(DATASET_POSTS_USERS_30),
+            str(DATASET_POSTS_USERS_31),
+            str(DATASET_POSTS_USERS_32),
+            str(DATASET_POSTS_USERS_33),
+        ]
     else:
         dataset_paths = [_resolve_dataset_alias(args.dataset)]
 
