@@ -828,7 +828,7 @@ def detect_bots(dataset_path, threshold=DETECTION_THRESHOLD, verbose=False):
             bins[f">={threshold}"] += 1
     print(f"Score distribution: {dict(bins)}")
 
-    return detections, all_scores
+    return detections, all_scores, lang
 
 
 # ============================================================================
@@ -951,6 +951,12 @@ def main():
         dataset_paths = [_resolve_dataset_alias(args.dataset)]
 
     run_summaries = []
+    
+    def _output_path_for_lang(lang):
+            # Force valid language codes
+        if lang not in {"en", "fr"}:
+                lang = "en"
+        return f"bot_smashers.detections.{lang}.txt"
 
     for dataset_path in dataset_paths:
         print("\n" + "#" * 60)
@@ -958,17 +964,17 @@ def main():
         print("#" * 60)
 
         # Run detection
-        detections, all_scores = detect_bots(
+        detections, all_scores, lang = detect_bots(
             dataset_path,
             threshold=args.threshold,
             verbose=args.verbose,
         )
-
+        
         # Write output (dataset-specific names when running multiple datasets)
-        output_path = args.output
-        if len(dataset_paths) > 1:
-            output_path = _output_path_for_dataset(args.output, dataset_path)
+        output_path = _output_path_for_lang(lang)   
         write_detections(detections, output_path)
+        
+
 
         # Evaluate if ground truth is provided/available
         bots_path = args.bots or _default_bots_for_dataset(dataset_path)
