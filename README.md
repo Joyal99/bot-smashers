@@ -122,6 +122,20 @@ python detector.py 30 -t 3 -o detections.txt -v
 python detector.py 31 -b data/dataset.bots.31.txt
 ```
 
+### Dataset 34 (EN) and Dataset 35 (FR) Submission Outputs
+
+To generate the required team submission files:
+
+```bash
+python detector.py dataset.posts&users.34.json -o bot_smashers.detections.en
+python detector.py dataset.posts&users.35.json -o bot_smashers.detections.fr
+```
+
+This will write:
+
+- English detections to `bot_smashers.detections.en`
+- French detections to `bot_smashers.detections.fr`
+
 Flags:
 
 - `-t, --threshold`: Detection threshold (default `3`).
@@ -137,6 +151,8 @@ Flags:
   - `detections.31.txt`
   - `detections.32.txt`
   - `detections.33.txt`
+  - `detections.34.txt`
+  - `detections.35.txt`
 
 ## Evaluation Metrics
 
