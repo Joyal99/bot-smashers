@@ -109,19 +109,6 @@ python detector.py 32
 python detector.py 33
 ```
 
-Run a custom dataset path:
-
-```bash
-python detector.py path/to/dataset.posts&users.custom.json
-```
-
-Useful options:
-
-```bash
-python detector.py 30 -t 3 -o detections.txt -v
-python detector.py 31 -b data/dataset.bots.31.txt
-```
-
 ### Dataset 34 (EN) and Dataset 35 (FR) Submission Outputs
 
 To generate the required team submission files:
